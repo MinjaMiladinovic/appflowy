@@ -1,544 +1,751 @@
-use crate::{
-    core::{operation::*, DeltaIter, FlowyStr, Interval, OperationTransformable, MAX_IV_LEN},
-    errors::{ErrorBuilder, OTError, OTErrorCode},
+#![allow(clippy::all)]
+use crate::editor::{Rng, TestBuilder, TestOp::*};
+use flowy_collaboration::document::{NewlineDoc, PlainDoc};
+use lib_ot::{
+    core::*,
+    rich_text::{AttributeBuilder, RichTextAttribute, RichTextAttributes, RichTextDelta},
 };
 
-use bytes::Bytes;
-use serde::de::DeserializeOwned;
-use std::{
-    cmp::{min, Ordering},
-    fmt,
-    iter::FromIterator,
-    str,
-    str::FromStr,
-};
-
-// TODO: optimize the memory usage with Arc_mut or Cow
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Delta<T: Attributes> {
-    pub ops: Vec<Operation<T>>,
-    pub utf16_base_len: usize,
-    pub utf16_target_len: usize,
+#[test]
+fn attributes_insert_text() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(0, "456", 3),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
 }
 
-impl<T> Default for Delta<T>
-where
-    T: Attributes,
-{
-    fn default() -> Self {
-        Self {
-            ops: Vec::new(),
-            utf16_base_len: 0,
-            utf16_target_len: 0,
-        }
-    }
+#[test]
+fn attributes_insert_text_at_head() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(0, "456", 0),
+        AssertDocJson(0, r#"[{"insert":"456123"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
 }
 
-impl<T> fmt::Display for Delta<T>
-where
-    T: Attributes,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // f.write_str(&serde_json::to_string(self).unwrap_or("".to_owned()))?;
-        f.write_str("[ ")?;
-        for op in &self.ops {
-            f.write_fmt(format_args!("{} ", op))?;
-        }
-        f.write_str("]")?;
-        Ok(())
-    }
+#[test]
+fn attributes_insert_text_at_middle() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(0, "456", 1),
+        AssertDocJson(0, r#"[{"insert":"145623"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
 }
 
-impl<T> FromIterator<Operation<T>> for Delta<T>
-where
-    T: Attributes,
-{
-    fn from_iter<I: IntoIterator<Item = Operation<T>>>(ops: I) -> Self {
-        let mut operations = Delta::default();
-        for op in ops {
-            operations.add(op);
-        }
-        operations
-    }
+#[test]
+fn delta_get_ops_in_interval_1() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("123").build();
+    let insert_b = OpBuilder::insert("4").build();
+
+    delta.add(insert_a.clone());
+    delta.add(insert_b.clone());
+
+    let mut iterator = DeltaIter::from_interval(&delta, Interval::new(0, 4));
+    assert_eq!(iterator.ops(), delta.ops);
 }
 
-impl<T> Delta<T>
-where
-    T: Attributes,
-{
-    pub fn new() -> Self { Self::default() }
+#[test]
+fn delta_get_ops_in_interval_2() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("123").build();
+    let insert_b = OpBuilder::insert("4").build();
+    let insert_c = OpBuilder::insert("5").build();
+    let retain_a = OpBuilder::retain(3).build();
 
-    #[inline]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            ops: Vec::with_capacity(capacity),
-            utf16_base_len: 0,
-            utf16_target_len: 0,
-        }
-    }
+    delta.add(insert_a.clone());
+    delta.add(retain_a.clone());
+    delta.add(insert_b.clone());
+    delta.add(insert_c.clone());
 
-    pub fn add(&mut self, op: Operation<T>) {
-        match op {
-            Operation::Delete(i) => self.delete(i),
-            Operation::Insert(i) => self.insert(&i.s, i.attributes),
-            Operation::Retain(r) => self.retain(r.n, r.attributes),
-        }
-    }
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 2)).ops(),
+        vec![OpBuilder::insert("12").build()]
+    );
 
-    pub fn delete(&mut self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        self.utf16_base_len += n as usize;
-        if let Some(Operation::Delete(n_last)) = self.ops.last_mut() {
-            *n_last += n;
-        } else {
-            self.ops.push(OpBuilder::delete(n).build());
-        }
-    }
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(1, 3)).ops(),
+        vec![OpBuilder::insert("23").build()]
+    );
 
-    pub fn insert(&mut self, s: &str, attributes: T) {
-        let s: FlowyStr = s.into();
-        if s.is_empty() {
-            return;
-        }
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 3)).ops(),
+        vec![insert_a.clone()]
+    );
 
-        self.utf16_target_len += s.utf16_size();
-        let new_last = match self.ops.as_mut_slice() {
-            [.., Operation::<T>::Insert(insert)] => {
-                //
-                insert.merge_or_new_op(&s, attributes)
-            },
-            [.., Operation::<T>::Insert(pre_insert), Operation::Delete(_)] => {
-                //
-                pre_insert.merge_or_new_op(&s, attributes)
-            },
-            [.., op_last @ Operation::<T>::Delete(_)] => {
-                let new_last = op_last.clone();
-                *op_last = OpBuilder::<T>::insert(&s).attributes(attributes).build();
-                Some(new_last)
-            },
-            _ => Some(OpBuilder::<T>::insert(&s).attributes(attributes).build()),
-        };
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 4)).ops(),
+        vec![insert_a.clone(), OpBuilder::retain(1).build()]
+    );
 
-        match new_last {
-            None => {},
-            Some(new_last) => self.ops.push(new_last),
-        }
-    }
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 6)).ops(),
+        vec![insert_a.clone(), retain_a.clone()]
+    );
 
-    pub fn retain(&mut self, n: usize, attributes: T) {
-        if n == 0 {
-            return;
-        }
-        self.utf16_base_len += n as usize;
-        self.utf16_target_len += n as usize;
-
-        if let Some(Operation::<T>::Retain(retain)) = self.ops.last_mut() {
-            if let Some(new_op) = retain.merge_or_new(n, attributes) {
-                self.ops.push(new_op);
-            }
-        } else {
-            self.ops.push(OpBuilder::<T>::retain(n).attributes(attributes).build());
-        }
-    }
-
-    /// Applies an operation to a string, returning a new string.
-    pub fn apply(&self, s: &str) -> Result<String, OTError> {
-        let s: FlowyStr = s.into();
-        if s.utf16_size() != self.utf16_base_len {
-            return Err(ErrorBuilder::new(OTErrorCode::IncompatibleLength).build());
-        }
-        let mut new_s = String::new();
-        let code_point_iter = &mut s.utf16_code_unit_iter();
-        for op in &self.ops {
-            match &op {
-                Operation::Retain(retain) => {
-                    for c in code_point_iter.take(retain.n as usize) {
-                        new_s.push_str(str::from_utf8(c.0).unwrap_or(""));
-                    }
-                },
-                Operation::Delete(delete) => {
-                    for _ in 0..*delete {
-                        code_point_iter.next();
-                    }
-                },
-                Operation::Insert(insert) => {
-                    new_s += &insert.s;
-                },
-            }
-        }
-        Ok(new_s)
-    }
-
-    /// Computes the inverse of an operation. The inverse of an operation is the
-    /// operation that reverts the effects of the operation
-    pub fn invert_str(&self, s: &str) -> Self {
-        let mut inverted = Delta::default();
-        let chars = &mut s.chars();
-        for op in &self.ops {
-            match &op {
-                Operation::Retain(retain) => {
-                    inverted.retain(retain.n, T::default());
-                    // TODO: use advance_by instead, but it's unstable now
-                    // chars.advance_by(retain.num)
-                    for _ in 0..retain.n {
-                        chars.next();
-                    }
-                },
-                Operation::Insert(insert) => {
-                    inverted.delete(insert.utf16_size());
-                },
-                Operation::Delete(delete) => {
-                    inverted.insert(&chars.take(*delete as usize).collect::<String>(), op.get_attributes());
-                },
-            }
-        }
-        inverted
-    }
-
-    /// Checks if this operation has no effect.
-    #[inline]
-    pub fn is_noop(&self) -> bool { matches!(self.ops.as_slice(), [] | [Operation::Retain(_)]) }
-
-    pub fn is_empty(&self) -> bool { self.ops.is_empty() }
-
-    pub fn extend(&mut self, other: Self) { other.ops.into_iter().for_each(|op| self.add(op)); }
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 7)).ops(),
+        vec![insert_a.clone(), retain_a.clone(), insert_b.clone()]
+    );
 }
 
-impl<T> OperationTransformable for Delta<T>
-where
-    T: Attributes,
-{
-    fn compose(&self, other: &Self) -> Result<Self, OTError>
-    where
-        Self: Sized,
-    {
-        let mut new_delta = Delta::default();
-        let mut iter = DeltaIter::new(self);
-        let mut other_iter = DeltaIter::new(other);
+#[test]
+fn delta_get_ops_in_interval_3() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("123456").build();
+    delta.add(insert_a.clone());
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(3, 5)).ops(),
+        vec![OpBuilder::insert("45").build()]
+    );
+}
 
-        while iter.has_next() || other_iter.has_next() {
-            if other_iter.is_next_insert() {
-                new_delta.add(other_iter.next_op().unwrap());
-                continue;
-            }
+#[test]
+fn delta_get_ops_in_interval_4() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("12").build();
+    let insert_b = OpBuilder::insert("34").build();
+    let insert_c = OpBuilder::insert("56").build();
 
-            if iter.is_next_delete() {
-                new_delta.add(iter.next_op().unwrap());
-                continue;
-            }
+    delta.ops.push(insert_a.clone());
+    delta.ops.push(insert_b.clone());
+    delta.ops.push(insert_c.clone());
 
-            let length = min(
-                iter.next_op_len().unwrap_or(MAX_IV_LEN),
-                other_iter.next_op_len().unwrap_or(MAX_IV_LEN),
-            );
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 2)).ops(),
+        vec![insert_a]
+    );
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(2, 4)).ops(),
+        vec![insert_b]
+    );
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(4, 6)).ops(),
+        vec![insert_c]
+    );
 
-            let op = iter
-                .next_op_with_len(length)
-                .unwrap_or_else(|| OpBuilder::retain(length).build());
-            let other_op = other_iter
-                .next_op_with_len(length)
-                .unwrap_or_else(|| OpBuilder::retain(length).build());
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(2, 5)).ops(),
+        vec![OpBuilder::insert("34").build(), OpBuilder::insert("5").build()]
+    );
+}
 
-            // debug_assert_eq!(op.len(), other_op.len(), "Composing delta failed,");
+#[test]
+fn delta_get_ops_in_interval_5() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("123456").build();
+    let insert_b = OpBuilder::insert("789").build();
+    delta.ops.push(insert_a.clone());
+    delta.ops.push(insert_b.clone());
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(4, 8)).ops(),
+        vec![OpBuilder::insert("56").build(), OpBuilder::insert("78").build()]
+    );
 
-            match (&op, &other_op) {
-                (Operation::Retain(retain), Operation::Retain(other_retain)) => {
-                    let composed_attrs = retain.attributes.compose(&other_retain.attributes)?;
+    // assert_eq!(
+    //     DeltaIter::from_interval(&delta, Interval::new(8, 9)).ops(),
+    //     vec![Builder::insert("9").build()]
+    // );
+}
 
-                    new_delta.add(OpBuilder::retain(retain.n).attributes(composed_attrs).build())
-                },
-                (Operation::Insert(insert), Operation::Retain(other_retain)) => {
-                    let mut composed_attrs = insert.attributes.compose(&other_retain.attributes)?;
-                    composed_attrs.remove_empty();
-                    new_delta.add(OpBuilder::insert(op.get_data()).attributes(composed_attrs).build())
-                },
-                (Operation::Retain(_), Operation::Delete(_)) => {
-                    new_delta.add(other_op);
-                },
-                (a, b) => {
-                    debug_assert_eq!(a.is_insert(), true);
-                    debug_assert_eq!(b.is_delete(), true);
-                    continue;
-                },
-            }
-        }
-        Ok(new_delta)
-    }
+#[test]
+fn delta_get_ops_in_interval_6() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("12345678").build();
+    delta.add(insert_a.clone());
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(4, 6)).ops(),
+        vec![OpBuilder::insert("56").build()]
+    );
+}
 
-    fn transform(&self, other: &Self) -> Result<(Self, Self), OTError>
-    where
-        Self: Sized,
-    {
-        if self.utf16_base_len != other.utf16_base_len {
-            return Err(ErrorBuilder::new(OTErrorCode::IncompatibleLength)
-                .msg(format!(
-                    "cur base length: {}, other base length: {}",
-                    self.utf16_base_len, other.utf16_base_len
-                ))
-                .build());
-        }
+#[test]
+fn delta_get_ops_in_interval_7() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("12345").build();
+    let retain_a = OpBuilder::retain(3).build();
 
-        let mut a_prime = Delta::default();
-        let mut b_prime = Delta::default();
+    delta.add(insert_a.clone());
+    delta.add(retain_a.clone());
 
-        let mut ops1 = self.ops.iter().cloned();
-        let mut ops2 = other.ops.iter().cloned();
+    let mut iter_1 = DeltaIter::from_offset(&delta, 2);
+    assert_eq!(iter_1.next_op().unwrap(), OpBuilder::insert("345").build());
+    assert_eq!(iter_1.next_op().unwrap(), OpBuilder::retain(3).build());
 
-        let mut next_op1 = ops1.next();
-        let mut next_op2 = ops2.next();
-        loop {
-            match (&next_op1, &next_op2) {
-                (None, None) => break,
-                (Some(Operation::Insert(insert)), _) => {
-                    // let composed_attrs = transform_attributes(&next_op1, &next_op2, true);
-                    a_prime.insert(&insert.s, insert.attributes.clone());
-                    b_prime.retain(insert.utf16_size(), insert.attributes.clone());
-                    next_op1 = ops1.next();
-                },
-                (_, Some(Operation::Insert(o_insert))) => {
-                    let composed_attrs = transform_op_attribute(&next_op1, &next_op2)?;
-                    a_prime.retain(o_insert.utf16_size(), composed_attrs.clone());
-                    b_prime.insert(&o_insert.s, composed_attrs);
-                    next_op2 = ops2.next();
-                },
-                (None, _) => {
-                    return Err(ErrorBuilder::new(OTErrorCode::IncompatibleLength).build());
-                },
-                (_, None) => {
-                    return Err(ErrorBuilder::new(OTErrorCode::IncompatibleLength).build());
-                },
-                (Some(Operation::Retain(retain)), Some(Operation::Retain(o_retain))) => {
-                    let composed_attrs = transform_op_attribute(&next_op1, &next_op2)?;
-                    match retain.cmp(&o_retain) {
-                        Ordering::Less => {
-                            a_prime.retain(retain.n, composed_attrs.clone());
-                            b_prime.retain(retain.n, composed_attrs.clone());
-                            next_op2 = Some(OpBuilder::retain(o_retain.n - retain.n).build());
-                            next_op1 = ops1.next();
-                        },
-                        Ordering::Equal => {
-                            a_prime.retain(retain.n, composed_attrs.clone());
-                            b_prime.retain(retain.n, composed_attrs.clone());
-                            next_op1 = ops1.next();
-                            next_op2 = ops2.next();
-                        },
-                        Ordering::Greater => {
-                            a_prime.retain(o_retain.n, composed_attrs.clone());
-                            b_prime.retain(o_retain.n, composed_attrs.clone());
-                            next_op1 = Some(OpBuilder::retain(retain.n - o_retain.n).build());
-                            next_op2 = ops2.next();
-                        },
-                    };
-                },
-                (Some(Operation::Delete(i)), Some(Operation::Delete(j))) => match i.cmp(&j) {
-                    Ordering::Less => {
-                        next_op2 = Some(OpBuilder::delete(*j - *i).build());
-                        next_op1 = ops1.next();
-                    },
-                    Ordering::Equal => {
-                        next_op1 = ops1.next();
-                        next_op2 = ops2.next();
-                    },
-                    Ordering::Greater => {
-                        next_op1 = Some(OpBuilder::delete(*i - *j).build());
-                        next_op2 = ops2.next();
-                    },
-                },
-                (Some(Operation::Delete(i)), Some(Operation::Retain(o_retain))) => {
-                    match i.cmp(&o_retain) {
-                        Ordering::Less => {
-                            a_prime.delete(*i);
-                            next_op2 = Some(OpBuilder::retain(o_retain.n - *i).build());
-                            next_op1 = ops1.next();
-                        },
-                        Ordering::Equal => {
-                            a_prime.delete(*i);
-                            next_op1 = ops1.next();
-                            next_op2 = ops2.next();
-                        },
-                        Ordering::Greater => {
-                            a_prime.delete(o_retain.n);
-                            next_op1 = Some(OpBuilder::delete(*i - o_retain.n).build());
-                            next_op2 = ops2.next();
-                        },
-                    };
-                },
-                (Some(Operation::Retain(retain)), Some(Operation::Delete(j))) => {
-                    match retain.cmp(&j) {
-                        Ordering::Less => {
-                            b_prime.delete(retain.n);
-                            next_op2 = Some(OpBuilder::delete(*j - retain.n).build());
-                            next_op1 = ops1.next();
-                        },
-                        Ordering::Equal => {
-                            b_prime.delete(retain.n);
-                            next_op1 = ops1.next();
-                            next_op2 = ops2.next();
-                        },
-                        Ordering::Greater => {
-                            b_prime.delete(*j);
-                            next_op1 = Some(OpBuilder::retain(retain.n - *j).build());
-                            next_op2 = ops2.next();
-                        },
-                    };
-                },
-            }
-        }
-        Ok((a_prime, b_prime))
-    }
+    let mut iter_2 = DeltaIter::new(&delta);
+    assert_eq!(iter_2.next_op_with_len(2).unwrap(), OpBuilder::insert("12").build());
+    assert_eq!(iter_2.next_op().unwrap(), OpBuilder::insert("345").build());
 
-    fn invert(&self, other: &Self) -> Self {
-        let mut inverted = Delta::default();
-        if other.is_empty() {
-            return inverted;
-        }
+    assert_eq!(iter_2.next_op().unwrap(), OpBuilder::retain(3).build());
+}
 
-        let mut index = 0;
-        for op in &self.ops {
-            let len: usize = op.len() as usize;
-            match op {
-                Operation::Delete(n) => {
-                    invert_from_other(&mut inverted, other, op, index, index + *n);
-                    index += len;
-                },
-                Operation::Retain(_) => {
-                    match op.has_attribute() {
-                        true => invert_from_other(&mut inverted, other, op, index, index + len),
-                        false => {
-                            // tracing::trace!("invert retain: {} by retain {} {}", op, len,
-                            // op.get_attributes());
-                            inverted.retain(len as usize, op.get_attributes())
-                        },
-                    }
-                    index += len;
-                },
-                Operation::Insert(_) => {
-                    // tracing::trace!("invert insert: {} by delete {}", op, len);
-                    inverted.delete(len as usize);
-                },
-            }
-        }
-        inverted
+#[test]
+fn delta_op_seek() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("12345").build();
+    let retain_a = OpBuilder::retain(3).build();
+    delta.add(insert_a.clone());
+    delta.add(retain_a.clone());
+    let mut iter = DeltaIter::new(&delta);
+    iter.seek::<OpMetric>(1);
+    assert_eq!(iter.next_op().unwrap(), OpBuilder::retain(3).build());
+}
+
+#[test]
+fn delta_utf16_code_unit_seek() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+
+    let mut iter = DeltaIter::new(&delta);
+    iter.seek::<Utf16CodeUnitMetric>(3);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("45").build());
+}
+
+#[test]
+fn delta_utf16_code_unit_seek_with_attributes() {
+    let mut delta = RichTextDelta::default();
+    let attributes = AttributeBuilder::new()
+        .add_attr(RichTextAttribute::Bold(true))
+        .add_attr(RichTextAttribute::Italic(true))
+        .build();
+
+    delta.add(OpBuilder::insert("1234").attributes(attributes.clone()).build());
+    delta.add(OpBuilder::insert("\n").build());
+
+    let mut iter = DeltaIter::new(&delta);
+    iter.seek::<Utf16CodeUnitMetric>(0);
+
+    assert_eq!(
+        iter.next_op_with_len(4).unwrap(),
+        OpBuilder::insert("1234").attributes(attributes).build(),
+    );
+}
+
+#[test]
+fn delta_next_op_len() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("12").build());
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("34").build());
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("5").build());
+    assert_eq!(iter.next_op_with_len(1), None);
+}
+
+#[test]
+fn delta_next_op_len_with_chinese() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("你好").build());
+
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_len().unwrap(), 2);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("你好").build());
+}
+
+#[test]
+fn delta_next_op_len_with_english() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("ab").build());
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_len().unwrap(), 2);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("ab").build());
+}
+
+#[test]
+fn delta_next_op_len_after_seek() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_len().unwrap(), 5);
+    iter.seek::<Utf16CodeUnitMetric>(3);
+    assert_eq!(iter.next_op_len().unwrap(), 2);
+    assert_eq!(iter.next_op_with_len(1).unwrap(), OpBuilder::insert("4").build());
+    assert_eq!(iter.next_op_len().unwrap(), 1);
+    assert_eq!(iter.next_op().unwrap(), OpBuilder::insert("5").build());
+}
+
+#[test]
+fn delta_next_op_len_none() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    let mut iter = DeltaIter::new(&delta);
+
+    assert_eq!(iter.next_op_len().unwrap(), 5);
+    assert_eq!(iter.next_op_with_len(5).unwrap(), OpBuilder::insert("12345").build());
+    assert_eq!(iter.next_op_len(), None);
+}
+
+#[test]
+fn delta_next_op_with_len_zero() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_with_len(0), None,);
+    assert_eq!(iter.next_op_len().unwrap(), 5);
+}
+
+#[test]
+fn delta_next_op_with_len_cross_op_return_last() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    delta.add(OpBuilder::retain(1).build());
+    delta.add(OpBuilder::insert("678").build());
+
+    let mut iter = DeltaIter::new(&delta);
+    iter.seek::<Utf16CodeUnitMetric>(4);
+    assert_eq!(iter.next_op_len().unwrap(), 1);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::retain(1).build());
+}
+
+#[test]
+fn lengths() {
+    let mut delta = RichTextDelta::default();
+    assert_eq!(delta.utf16_base_len, 0);
+    assert_eq!(delta.utf16_target_len, 0);
+    delta.retain(5, RichTextAttributes::default());
+    assert_eq!(delta.utf16_base_len, 5);
+    assert_eq!(delta.utf16_target_len, 5);
+    delta.insert("abc", RichTextAttributes::default());
+    assert_eq!(delta.utf16_base_len, 5);
+    assert_eq!(delta.utf16_target_len, 8);
+    delta.retain(2, RichTextAttributes::default());
+    assert_eq!(delta.utf16_base_len, 7);
+    assert_eq!(delta.utf16_target_len, 10);
+    delta.delete(2);
+    assert_eq!(delta.utf16_base_len, 9);
+    assert_eq!(delta.utf16_target_len, 10);
+}
+#[test]
+fn sequence() {
+    let mut delta = RichTextDelta::default();
+    delta.retain(5, RichTextAttributes::default());
+    delta.retain(0, RichTextAttributes::default());
+    delta.insert("appflowy", RichTextAttributes::default());
+    delta.insert("", RichTextAttributes::default());
+    delta.delete(3);
+    delta.delete(0);
+    assert_eq!(delta.ops.len(), 3);
+}
+
+#[test]
+fn apply_1000() {
+    for _ in 0..1 {
+        let mut rng = Rng::default();
+        let s: FlowyStr = rng.gen_string(50).into();
+        let delta = rng.gen_delta(&s);
+        assert_eq!(s.utf16_size(), delta.utf16_base_len);
     }
 }
 
-/// Removes trailing retain operation with empty attributes, if present.
-pub fn trim<T>(delta: &mut Delta<T>)
-where
-    T: Attributes,
-{
-    if let Some(last) = delta.ops.last() {
-        if last.is_retain() && last.is_plain() {
-            delta.ops.pop();
-        }
+#[test]
+fn apply() {
+    let s = "hello world,".to_owned();
+    let mut delta_a = RichTextDelta::default();
+    delta_a.insert(&s, RichTextAttributes::default());
+
+    let mut delta_b = RichTextDelta::default();
+    delta_b.retain(s.len(), RichTextAttributes::default());
+    delta_b.insert("appflowy", RichTextAttributes::default());
+
+    let after_a = delta_a.apply("").unwrap();
+    let after_b = delta_b.apply(&after_a).unwrap();
+    assert_eq!("hello world,appflowy", &after_b);
+}
+
+#[test]
+fn base_len_test() {
+    let mut delta_a = RichTextDelta::default();
+    delta_a.insert("a", RichTextAttributes::default());
+    delta_a.insert("b", RichTextAttributes::default());
+    delta_a.insert("c", RichTextAttributes::default());
+
+    let s = "hello world,".to_owned();
+    delta_a.delete(s.len());
+    let after_a = delta_a.apply(&s).unwrap();
+
+    delta_a.insert("d", RichTextAttributes::default());
+    assert_eq!("abc", &after_a);
+}
+
+#[test]
+fn invert() {
+    for _ in 0..1000 {
+        let mut rng = Rng::default();
+        let s = rng.gen_string(50);
+        let delta_a = rng.gen_delta(&s);
+        let delta_b = delta_a.invert_str(&s);
+        assert_eq!(delta_a.utf16_base_len, delta_b.utf16_target_len);
+        assert_eq!(delta_a.utf16_target_len, delta_b.utf16_base_len);
+        assert_eq!(delta_b.apply(&delta_a.apply(&s).unwrap()).unwrap(), s);
     }
 }
 
-fn invert_from_other<T: Attributes>(
-    base: &mut Delta<T>,
-    other: &Delta<T>,
-    operation: &Operation<T>,
-    start: usize,
-    end: usize,
-) {
-    tracing::trace!("invert op: {} [{}:{}]", operation, start, end);
-    let other_ops = DeltaIter::from_interval(other, Interval::new(start, end)).ops();
-    other_ops.into_iter().for_each(|other_op| match operation {
-        Operation::Delete(n) => {
-            tracing::trace!("invert delete: {} by add {}", n, other_op);
-            base.add(other_op);
-        },
-        Operation::Retain(_retain) => {
-            tracing::trace!(
-                "invert attributes: {:?}, {:?}",
-                operation.get_attributes(),
-                other_op.get_attributes()
-            );
-            let inverted_attrs = operation.get_attributes().invert(&other_op.get_attributes());
-            base.retain(other_op.len(), inverted_attrs);
-        },
-        Operation::Insert(_) => {
-            log::error!("Impossible to here. Insert operation should be treated as delete")
-        },
-    });
+#[test]
+fn empty_ops() {
+    let mut delta = RichTextDelta::default();
+    delta.retain(0, RichTextAttributes::default());
+    delta.insert("", RichTextAttributes::default());
+    delta.delete(0);
+    assert_eq!(delta.ops.len(), 0);
 }
-
-fn transform_op_attribute<T: Attributes>(
-    left: &Option<Operation<T>>,
-    right: &Option<Operation<T>>,
-) -> Result<T, OTError> {
-    if left.is_none() {
-        if right.is_none() {
-            return Ok(T::default());
-        }
-        return Ok(right.as_ref().unwrap().get_attributes());
-    }
-    let left = left.as_ref().unwrap().get_attributes();
-    let right = right.as_ref().unwrap().get_attributes();
-    // TODO: replace with anyhow and thiserror.
-    Ok(left.transform(&right)?.0)
+#[test]
+fn eq() {
+    let mut delta_a = RichTextDelta::default();
+    delta_a.delete(1);
+    delta_a.insert("lo", RichTextAttributes::default());
+    delta_a.retain(2, RichTextAttributes::default());
+    delta_a.retain(3, RichTextAttributes::default());
+    let mut delta_b = RichTextDelta::default();
+    delta_b.delete(1);
+    delta_b.insert("l", RichTextAttributes::default());
+    delta_b.insert("o", RichTextAttributes::default());
+    delta_b.retain(5, RichTextAttributes::default());
+    assert_eq!(delta_a, delta_b);
+    delta_a.delete(1);
+    delta_b.retain(1, RichTextAttributes::default());
+    assert_ne!(delta_a, delta_b);
 }
-
-impl<T> Delta<T>
-where
-    T: Attributes + DeserializeOwned,
-{
-    pub fn from_json(json: &str) -> Result<Self, OTError> {
-        let delta = serde_json::from_str(json).map_err(|e| {
-            tracing::trace!("Deserialize failed: {:?}", e);
-            tracing::trace!("{:?}", json);
-            e
-        })?;
-        Ok(delta)
-    }
-
-    pub fn from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Self, OTError> {
-        let json = str::from_utf8(bytes.as_ref())?.to_owned();
-        let val = Self::from_json(&json)?;
-        Ok(val)
-    }
+#[test]
+fn ops_merging() {
+    let mut delta = RichTextDelta::default();
+    assert_eq!(delta.ops.len(), 0);
+    delta.retain(2, RichTextAttributes::default());
+    assert_eq!(delta.ops.len(), 1);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::retain(2).build()));
+    delta.retain(3, RichTextAttributes::default());
+    assert_eq!(delta.ops.len(), 1);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::retain(5).build()));
+    delta.insert("abc", RichTextAttributes::default());
+    assert_eq!(delta.ops.len(), 2);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::insert("abc").build()));
+    delta.insert("xyz", RichTextAttributes::default());
+    assert_eq!(delta.ops.len(), 2);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::insert("abcxyz").build()));
+    delta.delete(1);
+    assert_eq!(delta.ops.len(), 3);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::delete(1).build()));
+    delta.delete(1);
+    assert_eq!(delta.ops.len(), 3);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::delete(2).build()));
 }
-
-impl<T> Delta<T>
-where
-    T: Attributes + serde::Serialize,
-{
-    pub fn to_json(&self) -> String { serde_json::to_string(self).unwrap_or_else(|_| "".to_owned()) }
-
-    pub fn to_bytes(&self) -> Bytes {
-        let json = self.to_json();
-        Bytes::from(json.into_bytes())
-    }
+#[test]
+fn is_noop() {
+    let mut delta = RichTextDelta::default();
+    assert!(delta.is_noop());
+    delta.retain(5, RichTextAttributes::default());
+    assert!(delta.is_noop());
+    delta.retain(3, RichTextAttributes::default());
+    assert!(delta.is_noop());
+    delta.insert("lorem", RichTextAttributes::default());
+    assert!(!delta.is_noop());
 }
+#[test]
+fn compose() {
+    for _ in 0..1000 {
+        let mut rng = Rng::default();
+        let s = rng.gen_string(20);
+        let a = rng.gen_delta(&s);
+        let after_a: FlowyStr = a.apply(&s).unwrap().into();
+        assert_eq!(a.utf16_target_len, after_a.utf16_size());
 
-impl<T> FromStr for Delta<T>
-where
-    T: Attributes,
-{
-    type Err = ();
+        let b = rng.gen_delta(&after_a);
+        let after_b: FlowyStr = b.apply(&after_a).unwrap().into();
+        assert_eq!(b.utf16_target_len, after_b.utf16_size());
 
-    fn from_str(s: &str) -> Result<Delta<T>, Self::Err> {
-        let mut delta = Delta::with_capacity(1);
-        delta.add(Operation::Insert(s.into()));
-        Ok(delta)
+        let ab = a.compose(&b).unwrap();
+        assert_eq!(ab.utf16_target_len, b.utf16_target_len);
+        let after_ab: FlowyStr = ab.apply(&s).unwrap().into();
+        assert_eq!(after_b, after_ab);
     }
 }
+#[test]
+fn transform_random_delta() {
+    for _ in 0..1000 {
+        let mut rng = Rng::default();
+        let s = rng.gen_string(20);
+        let a = rng.gen_delta(&s);
+        let b = rng.gen_delta(&s);
+        let (a_prime, b_prime) = a.transform(&b).unwrap();
+        let ab_prime = a.compose(&b_prime).unwrap();
+        let ba_prime = b.compose(&a_prime).unwrap();
+        assert_eq!(ab_prime, ba_prime);
 
-impl<T> std::convert::TryFrom<Vec<u8>> for Delta<T>
-where
-    T: Attributes + DeserializeOwned,
-{
-    type Error = OTError;
-    fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> { Delta::from_bytes(bytes) }
+        let after_ab_prime = ab_prime.apply(&s).unwrap();
+        let after_ba_prime = ba_prime.apply(&s).unwrap();
+        assert_eq!(after_ab_prime, after_ba_prime);
+    }
 }
 
-impl<T> std::convert::TryFrom<Bytes> for Delta<T>
-where
-    T: Attributes + DeserializeOwned,
-{
-    type Error = OTError;
+#[test]
+fn transform_with_two_delta() {
+    let mut a = RichTextDelta::default();
+    let mut a_s = String::new();
+    a.insert(
+        "123",
+        AttributeBuilder::new().add_attr(RichTextAttribute::Bold(true)).build(),
+    );
+    a_s = a.apply(&a_s).unwrap();
+    assert_eq!(&a_s, "123");
 
-    fn try_from(bytes: Bytes) -> Result<Self, Self::Error> { Delta::from_bytes(&bytes) }
+    let mut b = RichTextDelta::default();
+    let mut b_s = String::new();
+    b.insert("456", RichTextAttributes::default());
+    b_s = b.apply(&b_s).unwrap();
+    assert_eq!(&b_s, "456");
+
+    let (a_prime, b_prime) = a.transform(&b).unwrap();
+    assert_eq!(
+        r#"[{"insert":"123","attributes":{"bold":true}},{"retain":3}]"#,
+        serde_json::to_string(&a_prime).unwrap()
+    );
+    assert_eq!(
+        r#"[{"retain":3,"attributes":{"bold":true}},{"insert":"456"}]"#,
+        serde_json::to_string(&b_prime).unwrap()
+    );
+
+    let new_a = a.compose(&b_prime).unwrap();
+    let new_b = b.compose(&a_prime).unwrap();
+    assert_eq!(
+        r#"[{"insert":"123","attributes":{"bold":true}},{"insert":"456"}]"#,
+        serde_json::to_string(&new_a).unwrap()
+    );
+
+    assert_eq!(
+        r#"[{"insert":"123","attributes":{"bold":true}},{"insert":"456"}]"#,
+        serde_json::to_string(&new_b).unwrap()
+    );
+}
+
+#[test]
+fn transform_two_plain_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "456", 0),
+        Transform(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+        AssertDocJson(1, r#"[{"insert":"123456"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn transform_two_plain_delta2() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "456", 0),
+        TransformPrime(0, 1),
+        DocComposePrime(0, 1),
+        DocComposePrime(1, 0),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+        AssertDocJson(1, r#"[{"insert":"123456"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn transform_two_non_seq_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "456", 0),
+        TransformPrime(0, 1),
+        AssertPrimeJson(0, r#"[{"insert":"123"},{"retain":3}]"#),
+        AssertPrimeJson(1, r#"[{"retain":3},{"insert":"456"}]"#),
+        DocComposePrime(0, 1),
+        Insert(1, "78", 3),
+        Insert(1, "9", 5),
+        DocComposePrime(1, 0),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+        AssertDocJson(1, r#"[{"insert":"123456789"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn transform_two_conflict_non_seq_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "456", 0),
+        TransformPrime(0, 1),
+        DocComposePrime(0, 1),
+        Insert(1, "78", 0),
+        DocComposePrime(1, 0),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+        AssertDocJson(1, r#"[{"insert":"12378456"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_no_attribute_delta() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("123").build());
+
+    let mut change = RichTextDelta::default();
+    change.add(OpBuilder::retain(3).build());
+    change.add(OpBuilder::insert("456").build());
+    let undo = change.invert(&delta);
+
+    let new_delta = delta.compose(&change).unwrap();
+    let delta_after_undo = new_delta.compose(&undo).unwrap();
+
+    assert_eq!(delta_after_undo, delta);
+}
+
+#[test]
+fn delta_invert_no_attribute_delta2() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "4567", 0),
+        Invert(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_attribute_delta_with_no_attribute_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Bold(0, Interval::new(0, 3), true),
+        AssertDocJson(0, r#"[{"insert":"123","attributes":{"bold":"true"}}]"#),
+        Insert(1, "4567", 0),
+        Invert(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123","attributes":{"bold":"true"}}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_attribute_delta_with_no_attribute_delta2() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Bold(0, Interval::new(0, 3), true),
+        Insert(0, "456", 3),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"123456","attributes":{"bold":"true"}}]
+            "#,
+        ),
+        Italic(0, Interval::new(2, 4), true),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"12","attributes":{"bold":"true"}}, 
+            {"insert":"34","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"56","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+        Insert(1, "abc", 0),
+        Invert(0, 1),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"12","attributes":{"bold":"true"}},
+            {"insert":"34","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"56","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_no_attribute_delta_with_attribute_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "4567", 0),
+        Bold(1, Interval::new(0, 3), true),
+        AssertDocJson(1, r#"[{"insert":"456","attributes":{"bold":"true"}},{"insert":"7"}]"#),
+        Invert(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_no_attribute_delta_with_attribute_delta2() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        AssertDocJson(0, r#"[{"insert":"123"}]"#),
+        Insert(1, "abc", 0),
+        Bold(1, Interval::new(0, 3), true),
+        Insert(1, "d", 3),
+        Italic(1, Interval::new(1, 3), true),
+        AssertDocJson(
+            1,
+            r#"[{"insert":"a","attributes":{"bold":"true"}},{"insert":"bc","attributes":{"bold":"true","italic":"true"}},{"insert":"d","attributes":{"bold":"true"}}]"#,
+        ),
+        Invert(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_attribute_delta_with_attribute_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Bold(0, Interval::new(0, 3), true),
+        Insert(0, "456", 3),
+        AssertDocJson(0, r#"[{"insert":"123456","attributes":{"bold":"true"}}]"#),
+        Italic(0, Interval::new(2, 4), true),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"12","attributes":{"bold":"true"}},
+            {"insert":"34","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"56","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+        Insert(1, "abc", 0),
+        Bold(1, Interval::new(0, 3), true),
+        Insert(1, "d", 3),
+        Italic(1, Interval::new(1, 3), true),
+        AssertDocJson(
+            1,
+            r#"[
+            {"insert":"a","attributes":{"bold":"true"}},
+            {"insert":"bc","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"d","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+        Invert(0, 1),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"12","attributes":{"bold":"true"}},
+            {"insert":"34","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"56","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_compose_str() {
+    let ops = vec![
+        Insert(0, "1", 0),
+        Insert(0, "2", 1),
+        AssertDocJson(0, r#"[{"insert":"12\n"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<NewlineDoc>(ops);
+}
+
+#[test]
+#[should_panic]
+fn delta_compose_with_missing_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(0, "4", 3),
+        DocComposeDelta(1, 0),
+        AssertDocJson(0, r#"[{"insert":"1234\n"}]"#),
+        AssertStr(1, r#"4\n"#),
+    ];
+    TestBuilder::new().run_scripts::<NewlineDoc>(ops);
 }
