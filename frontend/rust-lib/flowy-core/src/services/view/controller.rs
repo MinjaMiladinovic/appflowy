@@ -1,418 +1,751 @@
-use bytes::Bytes;
-use flowy_collaboration::entities::{
-    doc::{DocumentDelta, DocumentId},
-    revision::{RepeatedRevision, Revision},
+#![allow(clippy::all)]
+use crate::editor::{Rng, TestBuilder, TestOp::*};
+use flowy_collaboration::document::{NewlineDoc, PlainDoc};
+use lib_ot::{
+    core::*,
+    rich_text::{AttributeBuilder, RichTextAttribute, RichTextAttributes, RichTextDelta},
 };
-use flowy_database::SqliteConnection;
-use futures::{FutureExt, StreamExt};
-use std::{collections::HashSet, sync::Arc};
 
-use crate::{
-    entities::{
-        trash::{RepeatedTrashId, TrashType},
-        view::{CreateViewParams, RepeatedView, UpdateViewParams, View, ViewId},
-    },
-    errors::{FlowyError, FlowyResult},
-    module::{WorkspaceDatabase, WorkspaceUser},
-    notify::{send_dart_notification, WorkspaceNotification},
-    services::{
-        server::Server,
-        view::sql::{ViewTable, ViewTableChangeset, ViewTableSql},
-        TrashController,
-        TrashEvent,
-    },
-};
-use flowy_core_data_model::entities::share::{ExportData, ExportParams};
-use flowy_database::kv::KV;
-use flowy_document::context::DocumentContext;
-use lib_infra::uuid_string;
-
-const LATEST_VIEW_ID: &str = "latest_view_id";
-
-pub(crate) struct ViewController {
-    user: Arc<dyn WorkspaceUser>,
-    server: Server,
-    database: Arc<dyn WorkspaceDatabase>,
-    trash_controller: Arc<TrashController>,
-    document_ctx: Arc<DocumentContext>,
+#[test]
+fn attributes_insert_text() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(0, "456", 3),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
 }
 
-impl ViewController {
-    pub(crate) fn new(
-        user: Arc<dyn WorkspaceUser>,
-        database: Arc<dyn WorkspaceDatabase>,
-        server: Server,
-        trash_can: Arc<TrashController>,
-        document_ctx: Arc<DocumentContext>,
-    ) -> Self {
-        Self {
-            user,
-            server,
-            database,
-            trash_controller: trash_can,
-            document_ctx,
-        }
-    }
-
-    pub(crate) fn init(&self) -> Result<(), FlowyError> {
-        let _ = self.document_ctx.init()?;
-        self.listen_trash_can_event();
-        Ok(())
-    }
-
-    #[tracing::instrument(level = "debug", skip(self, params), fields(name = %params.name), err)]
-    pub(crate) async fn create_view_from_params(&self, params: CreateViewParams) -> Result<View, FlowyError> {
-        let delta_data = Bytes::from(params.view_data.clone());
-        let user_id = self.user.user_id()?;
-        let repeated_revision: RepeatedRevision =
-            Revision::initial_revision(&user_id, &params.view_id, delta_data).into();
-        let _ = self
-            .document_ctx
-            .controller
-            .save_document(&params.view_id, repeated_revision)
-            .await?;
-        let view = self.create_view_on_server(params).await?;
-        let _ = self.create_view_on_local(view.clone()).await?;
-
-        Ok(view)
-    }
-
-    pub(crate) async fn create_view_on_local(&self, view: View) -> Result<(), FlowyError> {
-        let conn = &*self.database.db_connection()?;
-        let trash_can = self.trash_controller.clone();
-
-        conn.immediate_transaction::<_, FlowyError, _>(|| {
-            let belong_to_id = view.belong_to_id.clone();
-            let _ = self.save_view(view, conn)?;
-            let _ = notify_views_changed(&belong_to_id, trash_can, &conn)?;
-
-            Ok(())
-        })?;
-
-        Ok(())
-    }
-
-    pub(crate) fn save_view(&self, view: View, conn: &SqliteConnection) -> Result<(), FlowyError> {
-        let view_table = ViewTable::new(view);
-        let _ = ViewTableSql::create_view(view_table, conn)?;
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self, params), fields(view_id = %params.view_id), err)]
-    pub(crate) async fn read_view(&self, params: ViewId) -> Result<View, FlowyError> {
-        let conn = self.database.db_connection()?;
-        let view_table = ViewTableSql::read_view(&params.view_id, &*conn)?;
-
-        let trash_ids = self.trash_controller.read_trash_ids(&conn)?;
-        if trash_ids.contains(&view_table.id) {
-            return Err(FlowyError::record_not_found());
-        }
-
-        let view: View = view_table.into();
-        let _ = self.read_view_on_server(params);
-        Ok(view)
-    }
-
-    pub(crate) fn read_view_tables(&self, ids: Vec<String>) -> Result<Vec<ViewTable>, FlowyError> {
-        let conn = &*self.database.db_connection()?;
-        let mut view_tables = vec![];
-        conn.immediate_transaction::<_, FlowyError, _>(|| {
-            for view_id in ids {
-                view_tables.push(ViewTableSql::read_view(&view_id, conn)?);
-            }
-            Ok(())
-        })?;
-
-        Ok(view_tables)
-    }
-
-    #[tracing::instrument(level = "debug", skip(self, params), fields(doc_id = %params.doc_id), err)]
-    pub(crate) async fn open_view(&self, params: DocumentId) -> Result<DocumentDelta, FlowyError> {
-        let doc_id = params.doc_id.clone();
-        let editor = self.document_ctx.controller.open_document(&params.doc_id).await?;
-
-        KV::set_str(LATEST_VIEW_ID, doc_id.clone());
-        let document_json = editor.document_json().await?;
-        Ok(DocumentDelta {
-            doc_id,
-            delta_json: document_json,
-        })
-    }
-
-    #[tracing::instrument(level = "debug", skip(self,params), fields(doc_id = %params.doc_id), err)]
-    pub(crate) async fn close_view(&self, params: DocumentId) -> Result<(), FlowyError> {
-        let _ = self.document_ctx.controller.close_document(&params.doc_id)?;
-        Ok(())
-    }
-
-    #[tracing::instrument(level = "debug", skip(self,params), fields(doc_id = %params.doc_id), err)]
-    pub(crate) async fn delete_view(&self, params: DocumentId) -> Result<(), FlowyError> {
-        if let Some(view_id) = KV::get_str(LATEST_VIEW_ID) {
-            if view_id == params.doc_id {
-                let _ = KV::remove(LATEST_VIEW_ID);
-            }
-        }
-        let _ = self.document_ctx.controller.close_document(&params.doc_id)?;
-        Ok(())
-    }
-
-    #[tracing::instrument(level = "debug", skip(self, params), fields(doc_id = %params.doc_id), err)]
-    pub(crate) async fn duplicate_view(&self, params: DocumentId) -> Result<(), FlowyError> {
-        let view: View = ViewTableSql::read_view(&params.doc_id, &*self.database.db_connection()?)?.into();
-        let editor = self.document_ctx.controller.open_document(&params.doc_id).await?;
-        let document_json = editor.document_json().await?;
-        let duplicate_params = CreateViewParams {
-            belong_to_id: view.belong_to_id.clone(),
-            name: format!("{} (copy)", &view.name),
-            desc: view.desc.clone(),
-            thumbnail: "".to_owned(),
-            view_type: view.view_type.clone(),
-            view_data: document_json,
-            view_id: uuid_string(),
-        };
-
-        let _ = self.create_view_from_params(duplicate_params).await?;
-        Ok(())
-    }
-
-    #[tracing::instrument(level = "debug", skip(self, params), err)]
-    pub(crate) async fn export_doc(&self, params: ExportParams) -> Result<ExportData, FlowyError> {
-        let editor = self.document_ctx.controller.open_document(&params.doc_id).await?;
-        let delta_json = editor.document_json().await?;
-        Ok(ExportData {
-            data: delta_json,
-            export_type: params.export_type,
-        })
-    }
-
-    // belong_to_id will be the app_id or view_id.
-    #[tracing::instrument(level = "debug", skip(self), err)]
-    pub(crate) async fn read_views_belong_to(&self, belong_to_id: &str) -> Result<RepeatedView, FlowyError> {
-        // TODO: read from server
-        let conn = self.database.db_connection()?;
-        let repeated_view = read_belonging_views_on_local(belong_to_id, self.trash_controller.clone(), &conn)?;
-        Ok(repeated_view)
-    }
-
-    #[tracing::instrument(level = "debug", skip(self, params), err)]
-    pub(crate) async fn update_view(&self, params: UpdateViewParams) -> Result<View, FlowyError> {
-        let conn = &*self.database.db_connection()?;
-        let changeset = ViewTableChangeset::new(params.clone());
-        let view_id = changeset.id.clone();
-
-        let updated_view = conn.immediate_transaction::<_, FlowyError, _>(|| {
-            let _ = ViewTableSql::update_view(changeset, conn)?;
-            let view: View = ViewTableSql::read_view(&view_id, conn)?.into();
-            Ok(view)
-        })?;
-        send_dart_notification(&view_id, WorkspaceNotification::ViewUpdated)
-            .payload(updated_view.clone())
-            .send();
-
-        //
-        let _ = notify_views_changed(&updated_view.belong_to_id, self.trash_controller.clone(), conn)?;
-        let _ = self.update_view_on_server(params);
-        Ok(updated_view)
-    }
-
-    pub(crate) async fn receive_document_delta(&self, params: DocumentDelta) -> Result<DocumentDelta, FlowyError> {
-        let doc = self.document_ctx.controller.receive_local_delta(params).await?;
-        Ok(doc)
-    }
-
-    pub(crate) fn latest_visit_view(&self) -> FlowyResult<Option<View>> {
-        match KV::get_str(LATEST_VIEW_ID) {
-            None => Ok(None),
-            Some(view_id) => {
-                let conn = self.database.db_connection()?;
-                let view_table = ViewTableSql::read_view(&view_id, &*conn)?;
-                Ok(Some(view_table.into()))
-            },
-        }
-    }
-
-    pub(crate) fn set_latest_view(&self, view: &View) { KV::set_str(LATEST_VIEW_ID, view.id.clone()); }
+#[test]
+fn attributes_insert_text_at_head() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(0, "456", 0),
+        AssertDocJson(0, r#"[{"insert":"456123"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
 }
 
-impl ViewController {
-    #[tracing::instrument(skip(self), err)]
-    async fn create_view_on_server(&self, params: CreateViewParams) -> Result<View, FlowyError> {
-        let token = self.user.token()?;
-        let view = self.server.create_view(&token, params).await?;
-        Ok(view)
-    }
-
-    #[tracing::instrument(skip(self), err)]
-    fn update_view_on_server(&self, params: UpdateViewParams) -> Result<(), FlowyError> {
-        let token = self.user.token()?;
-        let server = self.server.clone();
-        tokio::spawn(async move {
-            match server.update_view(&token, params).await {
-                Ok(_) => {},
-                Err(e) => {
-                    // TODO: retry?
-                    log::error!("Update view failed: {:?}", e);
-                },
-            }
-        });
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self), err)]
-    fn read_view_on_server(&self, params: ViewId) -> Result<(), FlowyError> {
-        let token = self.user.token()?;
-        let server = self.server.clone();
-        let pool = self.database.db_pool()?;
-        // TODO: Retry with RetryAction?
-        tokio::spawn(async move {
-            match server.read_view(&token, params).await {
-                Ok(Some(view)) => match pool.get() {
-                    Ok(conn) => {
-                        let view_table = ViewTable::new(view.clone());
-                        let result = ViewTableSql::create_view(view_table, &conn);
-                        match result {
-                            Ok(_) => {
-                                send_dart_notification(&view.id, WorkspaceNotification::ViewUpdated)
-                                    .payload(view.clone())
-                                    .send();
-                            },
-                            Err(e) => log::error!("Save view failed: {:?}", e),
-                        }
-                    },
-                    Err(e) => log::error!("Require db connection failed: {:?}", e),
-                },
-                Ok(None) => {},
-                Err(e) => log::error!("Read view failed: {:?}", e),
-            }
-        });
-        Ok(())
-    }
-
-    fn listen_trash_can_event(&self) {
-        let mut rx = self.trash_controller.subscribe();
-        let database = self.database.clone();
-        let document = self.document_ctx.clone();
-        let trash_can = self.trash_controller.clone();
-        let _ = tokio::spawn(async move {
-            loop {
-                let mut stream = Box::pin(rx.recv().into_stream().filter_map(|result| async move {
-                    match result {
-                        Ok(event) => event.select(TrashType::View),
-                        Err(_e) => None,
-                    }
-                }));
-
-                if let Some(event) = stream.next().await {
-                    handle_trash_event(database.clone(), document.clone(), trash_can.clone(), event).await
-                }
-            }
-        });
-    }
+#[test]
+fn attributes_insert_text_at_middle() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(0, "456", 1),
+        AssertDocJson(0, r#"[{"insert":"145623"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
 }
 
-#[tracing::instrument(level = "trace", skip(database, context, trash_can))]
-async fn handle_trash_event(
-    database: Arc<dyn WorkspaceDatabase>,
-    context: Arc<DocumentContext>,
-    trash_can: Arc<TrashController>,
-    event: TrashEvent,
-) {
-    let db_result = database.db_connection();
+#[test]
+fn delta_get_ops_in_interval_1() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("123").build();
+    let insert_b = OpBuilder::insert("4").build();
 
-    match event {
-        TrashEvent::NewTrash(identifiers, ret) => {
-            let result = || {
-                let conn = &*db_result?;
-                let view_tables = read_view_tables(identifiers, conn)?;
-                for view_table in view_tables {
-                    let _ = notify_views_changed(&view_table.belong_to_id, trash_can.clone(), conn)?;
-                    notify_dart(view_table, WorkspaceNotification::ViewDeleted);
-                }
-                Ok::<(), FlowyError>(())
-            };
-            let _ = ret.send(result()).await;
-        },
-        TrashEvent::Putback(identifiers, ret) => {
-            let result = || {
-                let conn = &*db_result?;
-                let view_tables = read_view_tables(identifiers, conn)?;
-                for view_table in view_tables {
-                    let _ = notify_views_changed(&view_table.belong_to_id, trash_can.clone(), conn)?;
-                    notify_dart(view_table, WorkspaceNotification::ViewRestored);
-                }
-                Ok::<(), FlowyError>(())
-            };
-            let _ = ret.send(result()).await;
-        },
-        TrashEvent::Delete(identifiers, ret) => {
-            let result = || {
-                let conn = &*db_result?;
-                let _ = conn.immediate_transaction::<_, FlowyError, _>(|| {
-                    let mut notify_ids = HashSet::new();
-                    for identifier in identifiers.items {
-                        let view_table = ViewTableSql::read_view(&identifier.id, conn)?;
-                        let _ = ViewTableSql::delete_view(&identifier.id, conn)?;
-                        let _ = context.controller.delete(&identifier.id)?;
-                        notify_ids.insert(view_table.belong_to_id);
-                    }
+    delta.add(insert_a.clone());
+    delta.add(insert_b.clone());
 
-                    for notify_id in notify_ids {
-                        let _ = notify_views_changed(&notify_id, trash_can.clone(), conn)?;
-                    }
+    let mut iterator = DeltaIter::from_interval(&delta, Interval::new(0, 4));
+    assert_eq!(iterator.ops(), delta.ops);
+}
 
-                    Ok(())
-                })?;
-                Ok::<(), FlowyError>(())
-            };
-            let _ = ret.send(result()).await;
-        },
+#[test]
+fn delta_get_ops_in_interval_2() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("123").build();
+    let insert_b = OpBuilder::insert("4").build();
+    let insert_c = OpBuilder::insert("5").build();
+    let retain_a = OpBuilder::retain(3).build();
+
+    delta.add(insert_a.clone());
+    delta.add(retain_a.clone());
+    delta.add(insert_b.clone());
+    delta.add(insert_c.clone());
+
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 2)).ops(),
+        vec![OpBuilder::insert("12").build()]
+    );
+
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(1, 3)).ops(),
+        vec![OpBuilder::insert("23").build()]
+    );
+
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 3)).ops(),
+        vec![insert_a.clone()]
+    );
+
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 4)).ops(),
+        vec![insert_a.clone(), OpBuilder::retain(1).build()]
+    );
+
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 6)).ops(),
+        vec![insert_a.clone(), retain_a.clone()]
+    );
+
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 7)).ops(),
+        vec![insert_a.clone(), retain_a.clone(), insert_b.clone()]
+    );
+}
+
+#[test]
+fn delta_get_ops_in_interval_3() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("123456").build();
+    delta.add(insert_a.clone());
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(3, 5)).ops(),
+        vec![OpBuilder::insert("45").build()]
+    );
+}
+
+#[test]
+fn delta_get_ops_in_interval_4() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("12").build();
+    let insert_b = OpBuilder::insert("34").build();
+    let insert_c = OpBuilder::insert("56").build();
+
+    delta.ops.push(insert_a.clone());
+    delta.ops.push(insert_b.clone());
+    delta.ops.push(insert_c.clone());
+
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(0, 2)).ops(),
+        vec![insert_a]
+    );
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(2, 4)).ops(),
+        vec![insert_b]
+    );
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(4, 6)).ops(),
+        vec![insert_c]
+    );
+
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(2, 5)).ops(),
+        vec![OpBuilder::insert("34").build(), OpBuilder::insert("5").build()]
+    );
+}
+
+#[test]
+fn delta_get_ops_in_interval_5() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("123456").build();
+    let insert_b = OpBuilder::insert("789").build();
+    delta.ops.push(insert_a.clone());
+    delta.ops.push(insert_b.clone());
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(4, 8)).ops(),
+        vec![OpBuilder::insert("56").build(), OpBuilder::insert("78").build()]
+    );
+
+    // assert_eq!(
+    //     DeltaIter::from_interval(&delta, Interval::new(8, 9)).ops(),
+    //     vec![Builder::insert("9").build()]
+    // );
+}
+
+#[test]
+fn delta_get_ops_in_interval_6() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("12345678").build();
+    delta.add(insert_a.clone());
+    assert_eq!(
+        DeltaIter::from_interval(&delta, Interval::new(4, 6)).ops(),
+        vec![OpBuilder::insert("56").build()]
+    );
+}
+
+#[test]
+fn delta_get_ops_in_interval_7() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("12345").build();
+    let retain_a = OpBuilder::retain(3).build();
+
+    delta.add(insert_a.clone());
+    delta.add(retain_a.clone());
+
+    let mut iter_1 = DeltaIter::from_offset(&delta, 2);
+    assert_eq!(iter_1.next_op().unwrap(), OpBuilder::insert("345").build());
+    assert_eq!(iter_1.next_op().unwrap(), OpBuilder::retain(3).build());
+
+    let mut iter_2 = DeltaIter::new(&delta);
+    assert_eq!(iter_2.next_op_with_len(2).unwrap(), OpBuilder::insert("12").build());
+    assert_eq!(iter_2.next_op().unwrap(), OpBuilder::insert("345").build());
+
+    assert_eq!(iter_2.next_op().unwrap(), OpBuilder::retain(3).build());
+}
+
+#[test]
+fn delta_op_seek() {
+    let mut delta = RichTextDelta::default();
+    let insert_a = OpBuilder::insert("12345").build();
+    let retain_a = OpBuilder::retain(3).build();
+    delta.add(insert_a.clone());
+    delta.add(retain_a.clone());
+    let mut iter = DeltaIter::new(&delta);
+    iter.seek::<OpMetric>(1);
+    assert_eq!(iter.next_op().unwrap(), OpBuilder::retain(3).build());
+}
+
+#[test]
+fn delta_utf16_code_unit_seek() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+
+    let mut iter = DeltaIter::new(&delta);
+    iter.seek::<Utf16CodeUnitMetric>(3);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("45").build());
+}
+
+#[test]
+fn delta_utf16_code_unit_seek_with_attributes() {
+    let mut delta = RichTextDelta::default();
+    let attributes = AttributeBuilder::new()
+        .add_attr(RichTextAttribute::Bold(true))
+        .add_attr(RichTextAttribute::Italic(true))
+        .build();
+
+    delta.add(OpBuilder::insert("1234").attributes(attributes.clone()).build());
+    delta.add(OpBuilder::insert("\n").build());
+
+    let mut iter = DeltaIter::new(&delta);
+    iter.seek::<Utf16CodeUnitMetric>(0);
+
+    assert_eq!(
+        iter.next_op_with_len(4).unwrap(),
+        OpBuilder::insert("1234").attributes(attributes).build(),
+    );
+}
+
+#[test]
+fn delta_next_op_len() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("12").build());
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("34").build());
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("5").build());
+    assert_eq!(iter.next_op_with_len(1), None);
+}
+
+#[test]
+fn delta_next_op_len_with_chinese() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("你好").build());
+
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_len().unwrap(), 2);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("你好").build());
+}
+
+#[test]
+fn delta_next_op_len_with_english() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("ab").build());
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_len().unwrap(), 2);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::insert("ab").build());
+}
+
+#[test]
+fn delta_next_op_len_after_seek() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_len().unwrap(), 5);
+    iter.seek::<Utf16CodeUnitMetric>(3);
+    assert_eq!(iter.next_op_len().unwrap(), 2);
+    assert_eq!(iter.next_op_with_len(1).unwrap(), OpBuilder::insert("4").build());
+    assert_eq!(iter.next_op_len().unwrap(), 1);
+    assert_eq!(iter.next_op().unwrap(), OpBuilder::insert("5").build());
+}
+
+#[test]
+fn delta_next_op_len_none() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    let mut iter = DeltaIter::new(&delta);
+
+    assert_eq!(iter.next_op_len().unwrap(), 5);
+    assert_eq!(iter.next_op_with_len(5).unwrap(), OpBuilder::insert("12345").build());
+    assert_eq!(iter.next_op_len(), None);
+}
+
+#[test]
+fn delta_next_op_with_len_zero() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    let mut iter = DeltaIter::new(&delta);
+    assert_eq!(iter.next_op_with_len(0), None,);
+    assert_eq!(iter.next_op_len().unwrap(), 5);
+}
+
+#[test]
+fn delta_next_op_with_len_cross_op_return_last() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("12345").build());
+    delta.add(OpBuilder::retain(1).build());
+    delta.add(OpBuilder::insert("678").build());
+
+    let mut iter = DeltaIter::new(&delta);
+    iter.seek::<Utf16CodeUnitMetric>(4);
+    assert_eq!(iter.next_op_len().unwrap(), 1);
+    assert_eq!(iter.next_op_with_len(2).unwrap(), OpBuilder::retain(1).build());
+}
+
+#[test]
+fn lengths() {
+    let mut delta = RichTextDelta::default();
+    assert_eq!(delta.utf16_base_len, 0);
+    assert_eq!(delta.utf16_target_len, 0);
+    delta.retain(5, RichTextAttributes::default());
+    assert_eq!(delta.utf16_base_len, 5);
+    assert_eq!(delta.utf16_target_len, 5);
+    delta.insert("abc", RichTextAttributes::default());
+    assert_eq!(delta.utf16_base_len, 5);
+    assert_eq!(delta.utf16_target_len, 8);
+    delta.retain(2, RichTextAttributes::default());
+    assert_eq!(delta.utf16_base_len, 7);
+    assert_eq!(delta.utf16_target_len, 10);
+    delta.delete(2);
+    assert_eq!(delta.utf16_base_len, 9);
+    assert_eq!(delta.utf16_target_len, 10);
+}
+#[test]
+fn sequence() {
+    let mut delta = RichTextDelta::default();
+    delta.retain(5, RichTextAttributes::default());
+    delta.retain(0, RichTextAttributes::default());
+    delta.insert("appflowy", RichTextAttributes::default());
+    delta.insert("", RichTextAttributes::default());
+    delta.delete(3);
+    delta.delete(0);
+    assert_eq!(delta.ops.len(), 3);
+}
+
+#[test]
+fn apply_1000() {
+    for _ in 0..1 {
+        let mut rng = Rng::default();
+        let s: FlowyStr = rng.gen_string(50).into();
+        let delta = rng.gen_delta(&s);
+        assert_eq!(s.utf16_size(), delta.utf16_base_len);
     }
 }
 
-fn read_view_tables(identifiers: RepeatedTrashId, conn: &SqliteConnection) -> Result<Vec<ViewTable>, FlowyError> {
-    let mut view_tables = vec![];
-    let _ = conn.immediate_transaction::<_, FlowyError, _>(|| {
-        for identifier in identifiers.items {
-            let view_table = ViewTableSql::read_view(&identifier.id, conn)?;
-            view_tables.push(view_table);
-        }
-        Ok(())
-    })?;
-    Ok(view_tables)
+#[test]
+fn apply() {
+    let s = "hello world,".to_owned();
+    let mut delta_a = RichTextDelta::default();
+    delta_a.insert(&s, RichTextAttributes::default());
+
+    let mut delta_b = RichTextDelta::default();
+    delta_b.retain(s.len(), RichTextAttributes::default());
+    delta_b.insert("appflowy", RichTextAttributes::default());
+
+    let after_a = delta_a.apply("").unwrap();
+    let after_b = delta_b.apply(&after_a).unwrap();
+    assert_eq!("hello world,appflowy", &after_b);
 }
 
-fn notify_dart(view_table: ViewTable, notification: WorkspaceNotification) {
-    let view: View = view_table.into();
-    send_dart_notification(&view.id, notification).payload(view).send();
+#[test]
+fn base_len_test() {
+    let mut delta_a = RichTextDelta::default();
+    delta_a.insert("a", RichTextAttributes::default());
+    delta_a.insert("b", RichTextAttributes::default());
+    delta_a.insert("c", RichTextAttributes::default());
+
+    let s = "hello world,".to_owned();
+    delta_a.delete(s.len());
+    let after_a = delta_a.apply(&s).unwrap();
+
+    delta_a.insert("d", RichTextAttributes::default());
+    assert_eq!("abc", &after_a);
 }
 
-#[tracing::instrument(skip(belong_to_id, trash_controller, conn), fields(view_count), err)]
-fn notify_views_changed(
-    belong_to_id: &str,
-    trash_controller: Arc<TrashController>,
-    conn: &SqliteConnection,
-) -> FlowyResult<()> {
-    let repeated_view = read_belonging_views_on_local(belong_to_id, trash_controller.clone(), conn)?;
-    tracing::Span::current().record("view_count", &format!("{}", repeated_view.len()).as_str());
-    send_dart_notification(&belong_to_id, WorkspaceNotification::AppViewsChanged)
-        .payload(repeated_view)
-        .send();
-    Ok(())
+#[test]
+fn invert() {
+    for _ in 0..1000 {
+        let mut rng = Rng::default();
+        let s = rng.gen_string(50);
+        let delta_a = rng.gen_delta(&s);
+        let delta_b = delta_a.invert_str(&s);
+        assert_eq!(delta_a.utf16_base_len, delta_b.utf16_target_len);
+        assert_eq!(delta_a.utf16_target_len, delta_b.utf16_base_len);
+        assert_eq!(delta_b.apply(&delta_a.apply(&s).unwrap()).unwrap(), s);
+    }
 }
 
-fn read_belonging_views_on_local(
-    belong_to_id: &str,
-    trash_controller: Arc<TrashController>,
-    conn: &SqliteConnection,
-) -> FlowyResult<RepeatedView> {
-    let mut view_tables = ViewTableSql::read_views(belong_to_id, conn)?;
-    let trash_ids = trash_controller.read_trash_ids(conn)?;
-    view_tables.retain(|view_table| !trash_ids.contains(&view_table.id));
+#[test]
+fn empty_ops() {
+    let mut delta = RichTextDelta::default();
+    delta.retain(0, RichTextAttributes::default());
+    delta.insert("", RichTextAttributes::default());
+    delta.delete(0);
+    assert_eq!(delta.ops.len(), 0);
+}
+#[test]
+fn eq() {
+    let mut delta_a = RichTextDelta::default();
+    delta_a.delete(1);
+    delta_a.insert("lo", RichTextAttributes::default());
+    delta_a.retain(2, RichTextAttributes::default());
+    delta_a.retain(3, RichTextAttributes::default());
+    let mut delta_b = RichTextDelta::default();
+    delta_b.delete(1);
+    delta_b.insert("l", RichTextAttributes::default());
+    delta_b.insert("o", RichTextAttributes::default());
+    delta_b.retain(5, RichTextAttributes::default());
+    assert_eq!(delta_a, delta_b);
+    delta_a.delete(1);
+    delta_b.retain(1, RichTextAttributes::default());
+    assert_ne!(delta_a, delta_b);
+}
+#[test]
+fn ops_merging() {
+    let mut delta = RichTextDelta::default();
+    assert_eq!(delta.ops.len(), 0);
+    delta.retain(2, RichTextAttributes::default());
+    assert_eq!(delta.ops.len(), 1);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::retain(2).build()));
+    delta.retain(3, RichTextAttributes::default());
+    assert_eq!(delta.ops.len(), 1);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::retain(5).build()));
+    delta.insert("abc", RichTextAttributes::default());
+    assert_eq!(delta.ops.len(), 2);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::insert("abc").build()));
+    delta.insert("xyz", RichTextAttributes::default());
+    assert_eq!(delta.ops.len(), 2);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::insert("abcxyz").build()));
+    delta.delete(1);
+    assert_eq!(delta.ops.len(), 3);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::delete(1).build()));
+    delta.delete(1);
+    assert_eq!(delta.ops.len(), 3);
+    assert_eq!(delta.ops.last(), Some(&OpBuilder::delete(2).build()));
+}
+#[test]
+fn is_noop() {
+    let mut delta = RichTextDelta::default();
+    assert!(delta.is_noop());
+    delta.retain(5, RichTextAttributes::default());
+    assert!(delta.is_noop());
+    delta.retain(3, RichTextAttributes::default());
+    assert!(delta.is_noop());
+    delta.insert("lorem", RichTextAttributes::default());
+    assert!(!delta.is_noop());
+}
+#[test]
+fn compose() {
+    for _ in 0..1000 {
+        let mut rng = Rng::default();
+        let s = rng.gen_string(20);
+        let a = rng.gen_delta(&s);
+        let after_a: FlowyStr = a.apply(&s).unwrap().into();
+        assert_eq!(a.utf16_target_len, after_a.utf16_size());
 
-    let views = view_tables
-        .into_iter()
-        .map(|view_table| view_table.into())
-        .collect::<Vec<View>>();
+        let b = rng.gen_delta(&after_a);
+        let after_b: FlowyStr = b.apply(&after_a).unwrap().into();
+        assert_eq!(b.utf16_target_len, after_b.utf16_size());
 
-    Ok(RepeatedView { items: views })
+        let ab = a.compose(&b).unwrap();
+        assert_eq!(ab.utf16_target_len, b.utf16_target_len);
+        let after_ab: FlowyStr = ab.apply(&s).unwrap().into();
+        assert_eq!(after_b, after_ab);
+    }
+}
+#[test]
+fn transform_random_delta() {
+    for _ in 0..1000 {
+        let mut rng = Rng::default();
+        let s = rng.gen_string(20);
+        let a = rng.gen_delta(&s);
+        let b = rng.gen_delta(&s);
+        let (a_prime, b_prime) = a.transform(&b).unwrap();
+        let ab_prime = a.compose(&b_prime).unwrap();
+        let ba_prime = b.compose(&a_prime).unwrap();
+        assert_eq!(ab_prime, ba_prime);
+
+        let after_ab_prime = ab_prime.apply(&s).unwrap();
+        let after_ba_prime = ba_prime.apply(&s).unwrap();
+        assert_eq!(after_ab_prime, after_ba_prime);
+    }
+}
+
+#[test]
+fn transform_with_two_delta() {
+    let mut a = RichTextDelta::default();
+    let mut a_s = String::new();
+    a.insert(
+        "123",
+        AttributeBuilder::new().add_attr(RichTextAttribute::Bold(true)).build(),
+    );
+    a_s = a.apply(&a_s).unwrap();
+    assert_eq!(&a_s, "123");
+
+    let mut b = RichTextDelta::default();
+    let mut b_s = String::new();
+    b.insert("456", RichTextAttributes::default());
+    b_s = b.apply(&b_s).unwrap();
+    assert_eq!(&b_s, "456");
+
+    let (a_prime, b_prime) = a.transform(&b).unwrap();
+    assert_eq!(
+        r#"[{"insert":"123","attributes":{"bold":true}},{"retain":3}]"#,
+        serde_json::to_string(&a_prime).unwrap()
+    );
+    assert_eq!(
+        r#"[{"retain":3,"attributes":{"bold":true}},{"insert":"456"}]"#,
+        serde_json::to_string(&b_prime).unwrap()
+    );
+
+    let new_a = a.compose(&b_prime).unwrap();
+    let new_b = b.compose(&a_prime).unwrap();
+    assert_eq!(
+        r#"[{"insert":"123","attributes":{"bold":true}},{"insert":"456"}]"#,
+        serde_json::to_string(&new_a).unwrap()
+    );
+
+    assert_eq!(
+        r#"[{"insert":"123","attributes":{"bold":true}},{"insert":"456"}]"#,
+        serde_json::to_string(&new_b).unwrap()
+    );
+}
+
+#[test]
+fn transform_two_plain_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "456", 0),
+        Transform(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+        AssertDocJson(1, r#"[{"insert":"123456"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn transform_two_plain_delta2() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "456", 0),
+        TransformPrime(0, 1),
+        DocComposePrime(0, 1),
+        DocComposePrime(1, 0),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+        AssertDocJson(1, r#"[{"insert":"123456"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn transform_two_non_seq_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "456", 0),
+        TransformPrime(0, 1),
+        AssertPrimeJson(0, r#"[{"insert":"123"},{"retain":3}]"#),
+        AssertPrimeJson(1, r#"[{"retain":3},{"insert":"456"}]"#),
+        DocComposePrime(0, 1),
+        Insert(1, "78", 3),
+        Insert(1, "9", 5),
+        DocComposePrime(1, 0),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+        AssertDocJson(1, r#"[{"insert":"123456789"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn transform_two_conflict_non_seq_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "456", 0),
+        TransformPrime(0, 1),
+        DocComposePrime(0, 1),
+        Insert(1, "78", 0),
+        DocComposePrime(1, 0),
+        AssertDocJson(0, r#"[{"insert":"123456"}]"#),
+        AssertDocJson(1, r#"[{"insert":"12378456"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_no_attribute_delta() {
+    let mut delta = RichTextDelta::default();
+    delta.add(OpBuilder::insert("123").build());
+
+    let mut change = RichTextDelta::default();
+    change.add(OpBuilder::retain(3).build());
+    change.add(OpBuilder::insert("456").build());
+    let undo = change.invert(&delta);
+
+    let new_delta = delta.compose(&change).unwrap();
+    let delta_after_undo = new_delta.compose(&undo).unwrap();
+
+    assert_eq!(delta_after_undo, delta);
+}
+
+#[test]
+fn delta_invert_no_attribute_delta2() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "4567", 0),
+        Invert(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_attribute_delta_with_no_attribute_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Bold(0, Interval::new(0, 3), true),
+        AssertDocJson(0, r#"[{"insert":"123","attributes":{"bold":"true"}}]"#),
+        Insert(1, "4567", 0),
+        Invert(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123","attributes":{"bold":"true"}}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_attribute_delta_with_no_attribute_delta2() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Bold(0, Interval::new(0, 3), true),
+        Insert(0, "456", 3),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"123456","attributes":{"bold":"true"}}]
+            "#,
+        ),
+        Italic(0, Interval::new(2, 4), true),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"12","attributes":{"bold":"true"}}, 
+            {"insert":"34","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"56","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+        Insert(1, "abc", 0),
+        Invert(0, 1),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"12","attributes":{"bold":"true"}},
+            {"insert":"34","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"56","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_no_attribute_delta_with_attribute_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(1, "4567", 0),
+        Bold(1, Interval::new(0, 3), true),
+        AssertDocJson(1, r#"[{"insert":"456","attributes":{"bold":"true"}},{"insert":"7"}]"#),
+        Invert(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_no_attribute_delta_with_attribute_delta2() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        AssertDocJson(0, r#"[{"insert":"123"}]"#),
+        Insert(1, "abc", 0),
+        Bold(1, Interval::new(0, 3), true),
+        Insert(1, "d", 3),
+        Italic(1, Interval::new(1, 3), true),
+        AssertDocJson(
+            1,
+            r#"[{"insert":"a","attributes":{"bold":"true"}},{"insert":"bc","attributes":{"bold":"true","italic":"true"}},{"insert":"d","attributes":{"bold":"true"}}]"#,
+        ),
+        Invert(0, 1),
+        AssertDocJson(0, r#"[{"insert":"123"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_invert_attribute_delta_with_attribute_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Bold(0, Interval::new(0, 3), true),
+        Insert(0, "456", 3),
+        AssertDocJson(0, r#"[{"insert":"123456","attributes":{"bold":"true"}}]"#),
+        Italic(0, Interval::new(2, 4), true),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"12","attributes":{"bold":"true"}},
+            {"insert":"34","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"56","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+        Insert(1, "abc", 0),
+        Bold(1, Interval::new(0, 3), true),
+        Insert(1, "d", 3),
+        Italic(1, Interval::new(1, 3), true),
+        AssertDocJson(
+            1,
+            r#"[
+            {"insert":"a","attributes":{"bold":"true"}},
+            {"insert":"bc","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"d","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+        Invert(0, 1),
+        AssertDocJson(
+            0,
+            r#"[
+            {"insert":"12","attributes":{"bold":"true"}},
+            {"insert":"34","attributes":{"bold":"true","italic":"true"}},
+            {"insert":"56","attributes":{"bold":"true"}}
+            ]"#,
+        ),
+    ];
+    TestBuilder::new().run_scripts::<PlainDoc>(ops);
+}
+
+#[test]
+fn delta_compose_str() {
+    let ops = vec![
+        Insert(0, "1", 0),
+        Insert(0, "2", 1),
+        AssertDocJson(0, r#"[{"insert":"12\n"}]"#),
+    ];
+    TestBuilder::new().run_scripts::<NewlineDoc>(ops);
+}
+
+#[test]
+#[should_panic]
+fn delta_compose_with_missing_delta() {
+    let ops = vec![
+        Insert(0, "123", 0),
+        Insert(0, "4", 3),
+        DocComposeDelta(1, 0),
+        AssertDocJson(0, r#"[{"insert":"1234\n"}]"#),
+        AssertStr(1, r#"4\n"#),
+    ];
+    TestBuilder::new().run_scripts::<NewlineDoc>(ops);
 }
